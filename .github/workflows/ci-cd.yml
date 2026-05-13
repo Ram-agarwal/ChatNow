@@ -1,36 +1,41 @@
-name: ChatNow CI/CD Pipeline 
+name: ChatNow CI/CD Pipeline (Local Minikube)
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
 
 env:
-  AWS_REGION: ${{ secrets.AWS_REGION }}
-  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
-  EKS_CLUSTER: prod-eks-cluster
+  BACKEND_TAG: ${{ github.run_number }}
+  FRONTEND_TAG: ${{ github.run_number }}
   K8S_NAMESPACE: chatnow
-  ECR_BACKEND: backend
-  BACKEND_TAG: v2
-  ECR_FRONTEND: frontend
-  FRONTEND_TAG: v1
 
+# ═══════════════════════════════════════════════════════════════
+# JOB 1 — OWASP Security Scan
+# ═══════════════════════════════════════════════════════════════
 jobs:
-  # ── Backend & Frontend Scans ──
+
   security-scans:
     name: OWASP Dependency Scans
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: Install dependencies
-        run: |
-          cd backend && npm ci
-          cd ../frontend && npm ci
-      # College Project: Scan chalega par fail nahi karega (continue-on-error: true)
-      - name: OWASP Check
+
+      - name: Install Backend Dependencies
+        run: cd backend && npm ci
+
+      - name: Install Frontend Dependencies
+        run: cd frontend && npm ci
+
+      # College Project: scan chalega par fail nahi karega
+      - name: Run OWASP Dependency Check
         continue-on-error: true
         uses: dependency-check/Dependency-Check_Action@main
         with:
@@ -38,64 +43,169 @@ jobs:
           path: .
           format: HTML
 
-  # ── Docker Build, Trivy Scan & ECR Push ──
-  build-and-push:
-    name: Build Images & Push to ECR
+# ═══════════════════════════════════════════════════════════════
+# JOB 2 — Docker Build & Save
+# ═══════════════════════════════════════════════════════════════
+
+  build:
+    name: Build Docker Images
     runs-on: ubuntu-latest
     needs: security-scans
-    steps:
-      - uses: actions/checkout@v4
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-      - name: Login to AWS ECR
-        uses: aws-actions/amazon-ecr-login@v2
-      
-      - name: Build & Tag Backend
-        run: |
-          docker build -t ${{ env.ECR_BACKEND }}:${{ env.BACKEND_TAG }} ./backend
-          docker tag ${{ env.ECR_BACKEND }}:${{ env.BACKEND_TAG }} ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_BACKEND }}:${{ env.BACKEND_TAG }}
-      
-      - name: Build & Tag Frontend
-        run: |
-          docker build -t ${{ env.ECR_FRONTEND }}:${{ env.FRONTEND_TAG }} ./frontend
-          docker tag ${{ env.ECR_FRONTEND }}:${{ env.FRONTEND_TAG }} ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_FRONTEND }}:${{ env.FRONTEND_TAG }}
 
-      # College Project: Trivy scan fail nahi karega
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Build Backend Docker Image
+        run: docker build -t backend:${{ env.BACKEND_TAG }} ./backend
+
+      - name: Build Frontend Docker Image
+        run: docker build -t frontend:${{ env.FRONTEND_TAG }} ./frontend
+
+      # Container security scan — fail nahi karega
       - name: Trivy Container Scan
         continue-on-error: true
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ env.ECR_BACKEND }}:${{ env.BACKEND_TAG }}
+          image-ref: backend:${{ env.BACKEND_TAG }}
           format: table
           severity: CRITICAL,HIGH
 
-      - name: Push Images
+      - name: Save Docker Images as tar
         run: |
-          docker push ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_BACKEND }}:${{ env.BACKEND_TAG }}
-          docker push ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_FRONTEND }}:${{ env.FRONTEND_TAG }}
+          docker save backend:${{ env.BACKEND_TAG }} -o backend.tar
+          docker save frontend:${{ env.FRONTEND_TAG }} -o frontend.tar
 
-  # ── Simple EKS Deploy ──
-  deploy:
-    name: Deploy to EKS
-    runs-on: ubuntu-latest
-    needs: build-and-push
-    steps:
-      - uses: actions/checkout@v4
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Upload Docker Images as Artifact
+        uses: actions/upload-artifact@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-      - name: Update kubeconfig
-        run: aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.EKS_CLUSTER }}
-      - name: Apply K8s Manifests
-        run: kubectl apply -f k8s/ -n ${{ env.K8S_NAMESPACE }}
-      - name: Deploy Images
+          name: docker-images
+          path: |
+            backend.tar
+            frontend.tar
+
+# ═══════════════════════════════════════════════════════════════
+# JOB 3 — Deploy to Minikube
+# ═══════════════════════════════════════════════════════════════
+
+  deploy:
+    name: Deploy to Minikube
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # ── Minikube Start ──
+      - name: Setup Minikube
+        uses: medyagh/setup-minikube@latest
+        with:
+          minikube-version: latest
+          driver: docker
+
+      # ── Namespace Create ──
+      - name: Create chatnow Namespace
         run: |
-          kubectl set image deployment/backend backend=${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_BACKEND }}:${{ env.BACKEND_TAG }} -n ${{ env.K8S_NAMESPACE }}
-          kubectl set image deployment/frontend frontend=${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_FRONTEND }}:${{ env.FRONTEND_TAG }} -n ${{ env.K8S_NAMESPACE }}
+          kubectl create namespace ${{ env.K8S_NAMESPACE }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      # ── Download Built Images ──
+      - name: Download Docker Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+
+      # ── Load into Docker then Minikube ──
+      - name: Load Images into Docker
+        run: |
+          docker load -i backend.tar
+          docker load -i frontend.tar
+
+      - name: Load Images into Minikube
+        run: |
+          minikube image load backend:${{ env.BACKEND_TAG }}
+          minikube image load frontend:${{ env.FRONTEND_TAG }}
+
+      # ── Patch image tags in deployment.yaml (single file mein sab hai) ──
+      - name: Patch Image Tags in deployment.yaml
+        run: |
+          sed -i "s|image: backend:.*|image: backend:${{ env.BACKEND_TAG }}|g" k8s/deployment.yaml
+          sed -i "s|image: frontend:.*|image: frontend:${{ env.FRONTEND_TAG }}|g" k8s/deployment.yaml
+
+      # ── Apply All K8s Manifests ──
+      - name: Apply Kubernetes Manifests
+        run: kubectl apply -f k8s/ -n ${{ env.K8S_NAMESPACE }}
+
+      # ── Rolling Update ──
+      - name: Rolling Update — Backend
+        run: |
+          kubectl set image deployment/backend \
+            backend=backend:${{ env.BACKEND_TAG }} \
+            -n ${{ env.K8S_NAMESPACE }}
+
+      - name: Rolling Update — Frontend
+        run: |
+          kubectl set image deployment/frontend \
+            frontend=frontend:${{ env.FRONTEND_TAG }} \
+            -n ${{ env.K8S_NAMESPACE }}
+
+      # ── Verify Rolling Update Complete ──
+      - name: Verify Backend Rollout
+        run: |
+          kubectl rollout status deployment/backend \
+            -n ${{ env.K8S_NAMESPACE }} --timeout=120s
+
+      - name: Verify Frontend Rollout
+        run: |
+          kubectl rollout status deployment/frontend \
+            -n ${{ env.K8S_NAMESPACE }} --timeout=120s
+
+      # ── Wait for All Pods Ready ──
+      - name: Wait for Backend Pods Ready
+        run: |
+          kubectl wait --for=condition=ready pod \
+            --selector=app=backend \
+            --timeout=120s \
+            -n ${{ env.K8S_NAMESPACE }}
+
+      - name: Wait for Frontend Pods Ready
+        run: |
+          kubectl wait --for=condition=ready pod \
+            --selector=app=frontend \
+            --timeout=120s \
+            -n ${{ env.K8S_NAMESPACE }}
+
+      - name: Wait for MongoDB Pod Ready
+        run: |
+          kubectl wait --for=condition=ready pod \
+            --selector=app=mongodb \
+            --timeout=120s \
+            -n ${{ env.K8S_NAMESPACE }}
+
+      # ── Final Status — iska screenshot lo viva ke liye ──
+      - name: Final Cluster Status
+        run: |
+          echo "============ PODS ============"
+          kubectl get pods -n ${{ env.K8S_NAMESPACE }}
+
+          echo "============ SERVICES ============"
+          kubectl get svc -n ${{ env.K8S_NAMESPACE }}
+
+          echo "============ DEPLOYMENTS ============"
+          kubectl get deployments -n ${{ env.K8S_NAMESPACE }}
+
+          echo "============ ROLLOUT HISTORY ============"
+          kubectl rollout history deployment/backend -n ${{ env.K8S_NAMESPACE }}
+          kubectl rollout history deployment/frontend -n ${{ env.K8S_NAMESPACE }}
+
+      # ── Auto Rollback if deploy failed ──
+      - name: Rollback on Failure
+        if: failure()
+        run: |
+          echo "Deployment failed! Rolling back..."
+          kubectl rollout undo deployment/backend -n ${{ env.K8S_NAMESPACE }}
+          kubectl rollout undo deployment/frontend -n ${{ env.K8S_NAMESPACE }}
+          echo "======= ROLLBACK STATUS ======="
+          kubectl get pods -n ${{ env.K8S_NAMESPACE }}
+          echo "Rollback completed"
